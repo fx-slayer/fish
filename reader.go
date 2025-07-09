@@ -216,6 +216,9 @@ func (r *Reader) Run() error {
 	}
 	defer rstore()
 	eventQ := r.catchExit()
+	if r.currentLine > r.totalLine {
+		r.currentLine = 0
+	}
 	r.printPage()
 	for {
 		var c byte

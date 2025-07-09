@@ -10,12 +10,17 @@ func main() {
 	if len(os.Args) == 1 {
 		exit("no file provided.")
 	}
-	wd, e := os.Getwd()
-	if e != nil {
-		exit(e)
+	fn := os.Args[1]
+	if !filepath.IsAbs(fn) {
+		wd, e := os.Getwd()
+		if e != nil {
+			exit(e)
+		}
+		fn = filepath.Join(wd, fn)
 	}
+
 	r := Reader{
-		f:        filepath.Join(wd, os.Args[1]),
+		f:        fn,
 		index:    []string{},
 		progress: make(map[string]int),
 	}
