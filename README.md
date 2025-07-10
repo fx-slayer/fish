@@ -18,4 +18,6 @@
   - `→` for next page.
   - `←` for previous page.
 
-- Auto page scrolling.❌
+- Auto page scrolling.✅
+
+  - `A` for switching scrolling mode.

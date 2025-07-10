@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/term"
 )
@@ -24,18 +25,30 @@ const (
 	CmdNextLine
 	CmdPrevLine
 	CmdNextHalfPage
+	CmdSwitchScrolling
 )
 
 type Reader struct {
-	f            string
-	data         string
-	progressFile string         // progress file path
-	index        []string       // line number:line content
-	progress     map[string]int // hex-md5:line number
-	totalLine    int
-	currentLine  int
-	winHeight    int
-	winWidth     int
+	f             string
+	data          string
+	progressFile  string         // progress file path
+	index         []string       // line number:line content
+	progress      map[string]int // hex-md5:line number
+	totalLine     int
+	currentLine   int
+	winHeight     int
+	winWidth      int
+	scrollingLine int
+	scrollingTk   <-chan time.Time
+}
+
+func NewReader(f string) Reader {
+	return Reader{
+		f:           f,
+		index:       []string{},
+		progress:    make(map[string]int),
+		scrollingTk: time.Tick(time.Second),
+	}
 }
 
 func (r *Reader) catchExit() chan byte {
@@ -48,6 +61,8 @@ func (r *Reader) catchExit() chan byte {
 				continue
 			}
 			switch b[0] {
+			case 'a':
+				inputCh <- CmdSwitchScrolling
 			case 0x0d:
 				if b[1] == 0x00 && b[2] == 0x00 {
 					inputCh <- CmdNextLine
@@ -142,7 +157,7 @@ func (r *Reader) updateWindowsSize() {
 	}
 	r.winWidth = width
 	r.winHeight = height
-	r.printPage()
+	r.renderPage()
 }
 
 func (r *Reader) daemonUpdateWindowSize() {
@@ -166,10 +181,23 @@ func (r *Reader) enterRawMode() (restore func(), err error) {
 	}, nil
 }
 
-func (r *Reader) printPos() {
+func (r *Reader) printInfo() {
 	f := float64(r.currentLine) / float64(r.totalLine)
 	//_, _ = fmt.Fprintf(os.Stdout, "> %s %d*%d %.02f%% %d/%d", path.Base(r.f), r.winWidth, r.winHeight, float64(r.currentLine)/float64(r.totalLine), r.currentLine, r.totalLine)
-	_, _ = fmt.Fprintf(os.Stdout, "> %s %d/%d %.02f%%", path.Base(r.f), r.currentLine, r.totalLine, f*100)
+	_, _ = fmt.Fprintf(os.Stdout, "> %s %d/%d %.02f%% [Q]:Quit [A]:Scroll(%s)", path.Base(r.f), r.currentLine, r.totalLine, f*100, r.scrollInfo())
+}
+
+func (r *Reader) scrollInfo() string {
+	switch r.scrollingLine {
+	case 0:
+		return "off"
+	case 1:
+		return "1"
+	case 2:
+		return "2"
+	default:
+		return "?"
+	}
 }
 
 func (r *Reader) clearScreenRaw() {
@@ -184,7 +212,7 @@ func (r *Reader) exitAltScreen() {
 	_, _ = os.Stdout.Write([]byte("\x1b[?1049l"))
 }
 
-func (r *Reader) printPage() {
+func (r *Reader) renderPage() {
 	start := r.currentLine
 	r.clearScreenRaw()
 	pageLines := r.winHeight - 1
@@ -198,8 +226,19 @@ func (r *Reader) printPage() {
 	for i := end - start; i < pageLines; i++ {
 		_, _ = fmt.Fprint(os.Stdout, "\r\n")
 	}
-	r.printPos()
+	r.printInfo()
 	r.saveProgress()
+}
+
+func (r *Reader) daemonScrolling() {
+	for range r.scrollingTk {
+		if r.scrollingLine > 0 {
+			if r.currentLine < r.totalLine-1 {
+				r.currentLine += r.scrollingLine
+			}
+			r.renderPage()
+		}
+	}
 }
 
 func (r *Reader) Run() error {
@@ -214,6 +253,7 @@ func (r *Reader) Run() error {
 	}
 	r.updateWindowsSize()
 	go r.daemonUpdateWindowSize()
+	go r.daemonScrolling()
 	rstore, e := r.enterRawMode()
 	if e != nil {
 		return e
@@ -223,13 +263,19 @@ func (r *Reader) Run() error {
 	if r.currentLine > r.totalLine {
 		r.currentLine = 0
 	}
-	r.printPage()
+	r.renderPage()
 	for {
 		var c byte
 		select {
 		case c = <-eventQ:
 		}
 		switch c {
+		case CmdSwitchScrolling:
+			if r.scrollingLine == 2 {
+				r.scrollingLine = 0
+			} else {
+				r.scrollingLine++
+			}
 		case CmdExit:
 			return nil
 		case CmdNextPage:
@@ -258,6 +304,6 @@ func (r *Reader) Run() error {
 				r.currentLine += off
 			}
 		}
-		r.printPage()
+		r.renderPage()
 	}
 }

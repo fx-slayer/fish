@@ -19,11 +19,7 @@ func main() {
 		fn = filepath.Join(wd, fn)
 	}
 
-	r := Reader{
-		f:        fn,
-		index:    []string{},
-		progress: make(map[string]int),
-	}
+	r := NewReader(fn)
 	if e := r.Run(); e != nil {
 		exit(e)
 	}
