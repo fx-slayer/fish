@@ -48,6 +48,10 @@ func (r *Reader) catchExit() chan byte {
 				continue
 			}
 			switch b[0] {
+			case 0x0d:
+				if b[1] == 0x00 && b[2] == 0x00 {
+					inputCh <- CmdNextLine
+				}
 			case 'q':
 				inputCh <- CmdExit
 			case ' ':

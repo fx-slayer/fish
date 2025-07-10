@@ -13,7 +13,7 @@
 - Shortcut for next/prev page.✅
 
   - `space` for next half page.
-  - `↓` for next line.
+  - `↓`,`enter` for next line.
   - `↑` for previous line.
   - `→` for next page.
   - `←` for previous page.
