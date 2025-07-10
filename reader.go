@@ -26,6 +26,7 @@ const (
 	CmdPrevLine
 	CmdNextHalfPage
 	CmdSwitchScrolling
+	CmdNULL // CmdNULL is used to indicate no command received but call Reader.renderPage.
 )
 
 type Reader struct {
@@ -40,57 +41,57 @@ type Reader struct {
 	winWidth      int
 	scrollingLine int
 	scrollingTk   <-chan time.Time
+	renderSignal  chan struct{}
+	eventSignal   chan byte
 }
 
 func NewReader(f string) Reader {
 	return Reader{
-		f:           f,
-		index:       []string{},
-		progress:    make(map[string]int),
-		scrollingTk: time.Tick(time.Second),
+		f:            f,
+		index:        []string{},
+		progress:     make(map[string]int),
+		scrollingTk:  time.Tick(time.Second),
+		renderSignal: make(chan struct{}),
+		eventSignal:  make(chan byte),
 	}
 }
 
-func (r *Reader) catchExit() chan byte {
-	inputCh := make(chan byte, 1)
-	go func() {
-		var b [3]byte
-		for {
-			_, err := os.Stdin.Read(b[:])
-			if err != nil {
+func (r *Reader) daemonCatchInput() {
+	var b [3]byte
+	for {
+		_, err := os.Stdin.Read(b[:])
+		if err != nil {
+			continue
+		}
+		switch b[0] {
+		case 'a':
+			r.eventSignal <- CmdSwitchScrolling
+		case 0x0d:
+			if b[1] == 0x00 && b[2] == 0x00 {
+				r.eventSignal <- CmdNextLine
+			}
+		case 'q':
+			r.eventSignal <- CmdExit
+		case ' ':
+			r.eventSignal <- CmdNextHalfPage
+		case 0x1b:
+			if b[1] != 0x5b {
 				continue
 			}
-			switch b[0] {
-			case 'a':
-				inputCh <- CmdSwitchScrolling
-			case 0x0d:
-				if b[1] == 0x00 && b[2] == 0x00 {
-					inputCh <- CmdNextLine
-				}
-			case 'q':
-				inputCh <- CmdExit
-			case ' ':
-				inputCh <- CmdNextHalfPage
-			case 0x1b:
-				if b[1] != 0x5b {
-					continue
-				}
-				switch b[2] {
-				case 0x41: // up arrow
-					inputCh <- CmdPrevLine
-				case 0x42: // down arrow
-					inputCh <- CmdNextLine
-				case 0x43: // right arrow
-					inputCh <- CmdNextPage
-				case 0x44: // left arrow
-					inputCh <- CmdPrevPage
-				default:
-					continue
-				}
+			switch b[2] {
+			case 0x41: // up arrow
+				r.eventSignal <- CmdPrevLine
+			case 0x42: // down arrow
+				r.eventSignal <- CmdNextLine
+			case 0x43: // right arrow
+				r.eventSignal <- CmdNextPage
+			case 0x44: // left arrow
+				r.eventSignal <- CmdPrevPage
+			default:
+				continue
 			}
 		}
-	}()
-	return inputCh
+	}
 }
 
 func (r *Reader) saveProgress() {
@@ -236,7 +237,7 @@ func (r *Reader) daemonScrolling() {
 			if r.currentLine < r.totalLine-1 {
 				r.currentLine += r.scrollingLine
 			}
-			r.renderPage()
+			r.eventSignal <- CmdNULL
 		}
 	}
 }
@@ -252,24 +253,23 @@ func (r *Reader) Run() error {
 		return e
 	}
 	r.updateWindowsSize()
-	go r.daemonUpdateWindowSize()
-	go r.daemonScrolling()
 	rstore, e := r.enterRawMode()
 	if e != nil {
 		return e
 	}
 	defer rstore()
-	eventQ := r.catchExit()
+	go r.daemonUpdateWindowSize()
+	go r.daemonScrolling()
+	go r.daemonRenderPage()
+	go r.daemonCatchInput()
 	if r.currentLine > r.totalLine {
 		r.currentLine = 0
 	}
 	r.renderPage()
 	for {
-		var c byte
-		select {
-		case c = <-eventQ:
-		}
-		switch c {
+		switch <-r.eventSignal {
+		case CmdNULL:
+			// no op.
 		case CmdSwitchScrolling:
 			if r.scrollingLine == 2 {
 				r.scrollingLine = 0
@@ -304,6 +304,12 @@ func (r *Reader) Run() error {
 				r.currentLine += off
 			}
 		}
+		r.renderSignal <- struct{}{}
+	}
+}
+
+func (r *Reader) daemonRenderPage() {
+	for range r.renderSignal {
 		r.renderPage()
 	}
 }
