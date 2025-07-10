@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -30,19 +31,21 @@ const (
 )
 
 type Reader struct {
-	f             string
-	data          string
-	progressFile  string         // progress file path
-	index         []string       // line number:line content
-	progress      map[string]int // hex-md5:line number
-	totalLine     int
-	currentLine   int
-	winHeight     int
-	winWidth      int
-	scrollingLine int
-	scrollingTk   <-chan time.Time
-	renderSignal  chan struct{}
-	eventSignal   chan byte
+	f                 string
+	data              string
+	progressFile      string // progress file path
+	progressFD        *os.File
+	progress          map[string]int // hex-md5:line number
+	previousSavedLine int
+	index             []string // line number:line content
+	totalLine         int
+	currentLine       int
+	winHeight         int
+	winWidth          int
+	scrollingLine     int
+	scrollingTk       <-chan time.Time
+	renderSignal      chan struct{}
+	eventSignal       chan byte
 }
 
 func NewReader(f string) Reader {
@@ -95,11 +98,16 @@ func (r *Reader) daemonCatchInput() {
 }
 
 func (r *Reader) saveProgress() {
-	//r.mu.Lock()
-	//defer r.mu.Unlock()
-	r.progress[r.f] = r.currentLine
+	// TODO exec when quit only?
+	if r.previousSavedLine == r.currentLine {
+		return
+	}
+	r.previousSavedLine = r.currentLine
+	r.progress[r.f] = r.previousSavedLine
 	pp, _ := json.MarshalIndent(r.progress, "", "  ")
-	_ = os.WriteFile(r.progressFile, pp, 0644)
+	_ = r.progressFD.Truncate(0)
+	_, _ = r.progressFD.Seek(0, 0)
+	_, _ = r.progressFD.Write(pp)
 }
 
 func (r *Reader) loadProgress() error {
@@ -113,8 +121,13 @@ func (r *Reader) loadProgress() error {
 			return e
 		}
 	}
+	f, e := os.OpenFile(d, os.O_RDWR, 0644)
+	if e != nil {
+		return e
+	}
 	r.progressFile = d
-	pp, e := os.ReadFile(d)
+	r.progressFD = f
+	pp, e := io.ReadAll(f)
 	if e != nil {
 		return e
 	}
@@ -124,6 +137,7 @@ func (r *Reader) loadProgress() error {
 	pos, ok := r.progress[r.f]
 	if ok {
 		r.currentLine = pos
+		r.previousSavedLine = pos
 	}
 	return nil
 }
@@ -231,6 +245,12 @@ func (r *Reader) renderPage() {
 	r.saveProgress()
 }
 
+func (r *Reader) daemonRenderPage() {
+	for range r.renderSignal {
+		r.renderPage()
+	}
+}
+
 func (r *Reader) daemonScrolling() {
 	for range r.scrollingTk {
 		if r.scrollingLine > 0 {
@@ -305,11 +325,5 @@ func (r *Reader) Run() error {
 			}
 		}
 		r.renderSignal <- struct{}{}
-	}
-}
-
-func (r *Reader) daemonRenderPage() {
-	for range r.renderSignal {
-		r.renderPage()
 	}
 }
