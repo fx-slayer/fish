@@ -46,6 +46,7 @@ type Reader struct {
 	scrollingTk       <-chan time.Time
 	renderSignal      chan struct{}
 	eventSignal       chan byte
+	debugW            io.Writer
 }
 
 func NewReader(f string) Reader {
@@ -56,6 +57,7 @@ func NewReader(f string) Reader {
 		scrollingTk:  time.Tick(time.Second),
 		renderSignal: make(chan struct{}),
 		eventSignal:  make(chan byte),
+		debugW:       os.Stderr,
 	}
 }
 
@@ -66,13 +68,12 @@ func (r *Reader) daemonCatchInput() {
 		if err != nil {
 			continue
 		}
+		//r.debugW.Write([]byte(fmt.Sprintf("%x", b[:])))
 		switch b[0] {
 		case 'a':
 			r.eventSignal <- CmdSwitchScrolling
 		case 0x0d:
-			if b[1] == 0x00 && b[2] == 0x00 {
-				r.eventSignal <- CmdNextLine
-			}
+			r.eventSignal <- CmdNextLine
 		case 'q':
 			r.eventSignal <- CmdExit
 		case ' ':
@@ -198,7 +199,6 @@ func (r *Reader) enterRawMode() (restore func(), err error) {
 
 func (r *Reader) printInfo() {
 	f := float64(r.currentLine) / float64(r.totalLine)
-	//_, _ = fmt.Fprintf(os.Stdout, "> %s %d*%d %.02f%% %d/%d", path.Base(r.f), r.winWidth, r.winHeight, float64(r.currentLine)/float64(r.totalLine), r.currentLine, r.totalLine)
 	_, _ = fmt.Fprintf(os.Stdout, "> %s %d/%d %.02f%% [Q]:Quit [A]:Scroll(%s)", path.Base(r.f), r.currentLine, r.totalLine, f*100, r.scrollInfo())
 }
 
