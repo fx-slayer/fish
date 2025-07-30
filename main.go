@@ -7,8 +7,10 @@ import (
 )
 
 func main() {
-	if len(os.Args) == 1 {
-		exit("no file provided.")
+	if len(os.Args) <= 1 ||
+		(os.Args[1] == "--help" || os.Args[1] == "-h") {
+		printHelp()
+		return
 	}
 	fn := os.Args[1]
 	if !filepath.IsAbs(fn) {
@@ -23,6 +25,23 @@ func main() {
 	if e := r.Run(); e != nil {
 		exit(e)
 	}
+}
+
+func printHelp() {
+	fmt.Println(`Name:
+  fish - A minimalist command-line reader for novels and long-form text.
+
+Usage:
+  fish <FILE>
+
+Description:
+  fish reads the specified text file in the terminal.
+  Your reading progress is automatically saved to: ~/.cmdline-reader-progress.
+  fish will resume from where you left off.
+
+Examples:
+  fish story.txt
+  fish ~/books/novel.txt`)
 }
 
 // exit gentle quit with any message.
