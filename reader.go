@@ -4,12 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -30,13 +29,22 @@ const (
 	CmdNULL // CmdNULL is used to indicate no command received but call Reader.renderPage.
 )
 
+// Reader is a command-line reader designed for reading books/long-text file.
+//
+// Reader.pageFactor: Default 0.75 ,due to line wrapping of long single lines, the terminal height does not
+// always match the number of text lines, so precise page turns cannot be achieved.
+// To ensure that the number of lines turned is less than the actual terminal height,
+// the actual NextPage/PrevPage commands use fewer lines than the ideal count.
 type Reader struct {
 	f                 string
 	data              string
 	progressFile      string // progress file path
 	progressFD        *os.File
-	progress          map[string]int // hex-md5:line number
+	progress          map[string]int // map[abs-filepath]progress
 	previousSavedLine int
+	jumpBreakMark     int
+	pageFactor        float64 // see Reader doc.
+	displayBreakMark  bool
 	index             []string // line number:line content
 	totalLine         int
 	currentLine       int
@@ -46,9 +54,10 @@ type Reader struct {
 	scrollingTk       <-chan time.Time
 	renderSignal      chan struct{}
 	eventSignal       chan byte
-	debugW            io.Writer
+	quitSignal        chan struct{}
 }
 
+// NewReader creates new reader, f must be absolute file path.
 func NewReader(f string) Reader {
 	return Reader{
 		f:            f,
@@ -57,25 +66,30 @@ func NewReader(f string) Reader {
 		scrollingTk:  time.Tick(time.Second),
 		renderSignal: make(chan struct{}),
 		eventSignal:  make(chan byte),
-		debugW:       os.Stderr,
+		quitSignal:   make(chan struct{}),
+		pageFactor:   0.75,
 	}
 }
 
 func (r *Reader) daemonCatchInput() {
 	var b [3]byte
 	for {
+		select {
+		case <-r.quitSignal:
+			return
+		default:
+		}
 		_, err := os.Stdin.Read(b[:])
 		if err != nil {
 			continue
 		}
-		//r.debugW.Write([]byte(fmt.Sprintf("%x", b[:])))
 		switch b[0] {
+		case 0x03, 0x04, 'q': // ctrl + c = 0x03 | ctrl + d = 0x04
+			r.eventSignal <- CmdExit
 		case 'a':
 			r.eventSignal <- CmdSwitchScrolling
-		case 0x0d:
+		case 0x0d: // key: enter
 			r.eventSignal <- CmdNextLine
-		case 'q':
-			r.eventSignal <- CmdExit
 		case ' ':
 			r.eventSignal <- CmdNextHalfPage
 		case 0x1b:
@@ -154,18 +168,6 @@ func (r *Reader) createIndex() error {
 	return nil
 }
 
-func (r *Reader) clearScreen() {
-	if runtime.GOOS == "windows" {
-		cmd := exec.Command("cmd", "/c", "cls")
-		cmd.Stdout = os.Stdout
-		_ = cmd.Run()
-	} else {
-		cmd := exec.Command("clear")
-		cmd.Stdout = os.Stdout
-		_ = cmd.Run()
-	}
-}
-
 func (r *Reader) updateWindowsSize() {
 	width, height, err := term.GetSize(int(os.Stdout.Fd()))
 	if err != nil {
@@ -180,8 +182,13 @@ func (r *Reader) daemonUpdateWindowSize() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGWINCH)
 	go func() {
-		for range sigCh {
-			r.updateWindowsSize()
+		for {
+			select {
+			case <-sigCh:
+				r.updateWindowsSize()
+			case <-r.quitSignal:
+				return
+			}
 		}
 	}()
 }
@@ -236,7 +243,12 @@ func (r *Reader) renderPage() {
 		end = len(r.index)
 	}
 	for i := start; i < end; i++ {
-		_, _ = fmt.Fprint(os.Stdout, r.index[i]+"\r\n")
+		if r.displayBreakMark && i == r.jumpBreakMark {
+			br := strings.Repeat("=", r.winHeight/2)
+			_, _ = fmt.Fprint(os.Stdout, br+"↓\r\n"+r.index[i]+"\r\n")
+		} else {
+			_, _ = fmt.Fprint(os.Stdout, r.index[i]+"\r\n")
+		}
 	}
 	for i := end - start; i < pageLines; i++ {
 		_, _ = fmt.Fprint(os.Stdout, "\r\n")
@@ -246,26 +258,37 @@ func (r *Reader) renderPage() {
 }
 
 func (r *Reader) daemonRenderPage() {
-	for range r.renderSignal {
-		r.renderPage()
+	for {
+		select {
+		case <-r.renderSignal:
+			r.renderPage()
+		case <-r.quitSignal:
+			return
+		}
 	}
 }
 
 func (r *Reader) daemonScrolling() {
-	for range r.scrollingTk {
-		if r.scrollingLine > 0 {
-			if r.currentLine < r.totalLine-1 {
-				r.currentLine += r.scrollingLine
+	for {
+		select {
+		case <-r.scrollingTk:
+			if r.scrollingLine > 0 {
+				if r.currentLine < r.totalLine-1 {
+					r.currentLine += r.scrollingLine
+				}
+				r.eventSignal <- CmdNULL
 			}
-			r.eventSignal <- CmdNULL
+		case <-r.quitSignal:
+			return
 		}
 	}
 }
 
 func (r *Reader) Run() error {
+	defer r.close()
 	r.enterAltScreen()
 	defer r.exitAltScreen()
-	r.clearScreen()
+	r.clearScreenRaw()
 	if e := r.createIndex(); e != nil {
 		return e
 	}
@@ -298,13 +321,15 @@ func (r *Reader) Run() error {
 			}
 		case CmdExit:
 			return nil
-		case CmdNextPage:
-			off := r.winHeight - 1
+		case CmdNextPage: // actually set to next 0.75 page
+			r.setBreakMark()
+			off := int(math.Round(float64(r.winHeight) * r.pageFactor))
 			if r.currentLine+off < r.totalLine {
 				r.currentLine += off
 			}
-		case CmdPrevPage:
-			off := r.winHeight - 1
+		case CmdPrevPage: // actually set to prev 0.75 page
+			r.setBreakMark()
+			off := int(math.Round(float64(r.winHeight) * r.pageFactor))
 			if r.currentLine-off >= 0 {
 				r.currentLine -= off
 			} else {
@@ -319,6 +344,7 @@ func (r *Reader) Run() error {
 				r.currentLine--
 			}
 		case CmdNextHalfPage:
+			r.setBreakMark()
 			off := r.winHeight / 2
 			if r.currentLine+r.winHeight-1 < r.totalLine {
 				r.currentLine += off
@@ -326,4 +352,16 @@ func (r *Reader) Run() error {
 		}
 		r.renderSignal <- struct{}{}
 	}
+}
+
+func (r *Reader) setBreakMark() {
+	r.jumpBreakMark = r.currentLine + r.winHeight - 1
+	r.displayBreakMark = true
+}
+
+func (r *Reader) close() {
+	if r.progressFD != nil {
+		_ = r.progressFD.Close()
+	}
+	close(r.quitSignal)
 }
