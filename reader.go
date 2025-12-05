@@ -71,6 +71,15 @@ func NewReader(f string) Reader {
 	}
 }
 
+// daemonCatchInput 监听键盘输入并将用户命令转换为事件信号。
+// 在RAW模式下直接捕获按键，无需用户按回车确认。
+// 支持的快捷键：
+// - 'q', Ctrl+C, Ctrl+D: 退出阅读器
+// - 'a': 切换自动滚屏模式
+// - Enter: 下一行
+// - Space: 下半页
+// - 上/下/左/右箭头: 上一行/下一行/上一页/下一页
+// 通过 r.eventSignal channel 向主事件循环发送命令。
 func (r *Reader) daemonCatchInput() {
 	var b [3]byte
 	for {
@@ -178,6 +187,10 @@ func (r *Reader) updateWindowsSize() {
 	r.renderPage()
 }
 
+// daemonUpdateWindowSize 监听终端窗口大小变化信号(SIGWINCH)。
+// 当用户调整终端窗口大小时，捕获该信号并立即重新计算窗口尺寸，
+// 重新渲染页面以适应新的窗口大小。
+// 这确保阅读器在任何时刻都与实际终端尺寸保持同步。
 func (r *Reader) daemonUpdateWindowSize() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGWINCH)
@@ -244,7 +257,7 @@ func (r *Reader) renderPage() {
 	}
 	for i := start; i < end; i++ {
 		if r.displayBreakMark && i == r.jumpBreakMark {
-			br := strings.Repeat("=", r.winHeight/2)
+			br := strings.Repeat("=", r.winWidth/2)
 			_, _ = fmt.Fprint(os.Stdout, br+"↓\r\n"+r.index[i]+"\r\n")
 		} else {
 			_, _ = fmt.Fprint(os.Stdout, r.index[i]+"\r\n")
@@ -257,6 +270,10 @@ func (r *Reader) renderPage() {
 	r.saveProgress()
 }
 
+// daemonRenderPage 监听渲染信号并负责页面刷新。
+// 当收到 r.renderSignal 信号时，调用 renderPage() 重新绘制当前页面。
+// 这种基于信号的渲染方式避免了不必要的频繁刷新，提高了性能。
+// 使用 channel 实现事件驱动的渲染机制，确保渲染和输入处理的并发安全。
 func (r *Reader) daemonRenderPage() {
 	for {
 		select {
@@ -268,6 +285,11 @@ func (r *Reader) daemonRenderPage() {
 	}
 }
 
+// daemonScrolling 实现自动滚屏功能，每秒触发一次(由 r.scrollingTk 时间ticker驱动)。
+// 当启用自动滚屏时(scrollingLine > 0)，每秒向下自动翻滚指定行数。
+// scrollingLine 的值为0(关闭)、1或2，用户可通过按'a'键循环切换。
+// 每次自动滚屏后发送 CmdNULL 命令触发页面重新渲染，更新显示内容。
+// 到达文末时停止滚屏。
 func (r *Reader) daemonScrolling() {
 	for {
 		select {
