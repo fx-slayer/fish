@@ -218,8 +218,11 @@ func (r *Reader) enterRawMode() (restore func(), err error) {
 }
 
 func (r *Reader) printInfo() {
-	f := float64(r.currentLine) / float64(r.totalLine)
-	_, _ = fmt.Fprintf(os.Stdout, "> %s %d/%d %.02f%% [Q]:Quit [A]:Scroll(%s)", path.Base(r.f), r.currentLine, r.totalLine, f*100, r.scrollInfo())
+	var percentage float64
+	if r.totalLine > 0 {
+		percentage = float64(r.currentLine) / float64(r.totalLine) * 100
+	}
+	_, _ = fmt.Fprintf(os.Stdout, "> %s %d/%d %.02f%% [Q]:Quit [A]:Scroll(%s)", path.Base(r.f), r.currentLine, r.totalLine, percentage, r.scrollInfo())
 }
 
 func (r *Reader) scrollInfo() string {
@@ -257,8 +260,8 @@ func (r *Reader) renderPage() {
 	}
 	for i := start; i < end; i++ {
 		if r.displayBreakMark && i == r.jumpBreakMark {
-			br := strings.Repeat("=", r.winWidth/2)
-			_, _ = fmt.Fprint(os.Stdout, br+"↓\r\n"+r.index[i]+"\r\n")
+			br := strings.Repeat(">", r.winWidth*3/4)
+			_, _ = fmt.Fprint(os.Stdout, br+"\r\n"+r.index[i]+"\r\n")
 		} else {
 			_, _ = fmt.Fprint(os.Stdout, r.index[i]+"\r\n")
 		}
@@ -348,6 +351,8 @@ func (r *Reader) Run() error {
 			off := int(math.Round(float64(r.winHeight) * r.pageFactor))
 			if r.currentLine+off < r.totalLine {
 				r.currentLine += off
+			} else if r.currentLine < r.totalLine-1 {
+				r.currentLine = r.totalLine - 1
 			}
 		case CmdPrevPage: // actually set to prev 0.75 page
 			r.setBreakMark()
@@ -368,8 +373,10 @@ func (r *Reader) Run() error {
 		case CmdNextHalfPage:
 			r.setBreakMark()
 			off := r.winHeight / 2
-			if r.currentLine+r.winHeight-1 < r.totalLine {
+			if r.currentLine+off < r.totalLine {
 				r.currentLine += off
+			} else if r.currentLine < r.totalLine-1 {
+				r.currentLine = r.totalLine - 1
 			}
 		}
 		r.renderSignal <- struct{}{}
