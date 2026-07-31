@@ -297,6 +297,24 @@ func (r *Reader) daemonUpdateWindowSize() {
 	}
 }
 
+// daemonCatchSignal turns termination signals into CmdExit so the reader leaves
+// through the normal path. Without this the process dies with the terminal still
+// in raw mode, on the alternate screen and with the cursor hidden, which the
+// user's shell has no way to recover from.
+func (r *Reader) daemonCatchSignal() {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGINT)
+	defer signal.Stop(sigCh)
+	select {
+	case <-sigCh:
+		select {
+		case r.eventSignal <- CmdExit:
+		case <-r.quitSignal:
+		}
+	case <-r.quitSignal:
+	}
+}
+
 func (r *Reader) enterRawMode() (restore func(), err error) {
 	fd := int(os.Stdin.Fd())
 	oldState, err := term.MakeRaw(fd)
@@ -342,6 +360,16 @@ func (r *Reader) enterAltScreen() {
 
 func (r *Reader) exitAltScreen() {
 	_, _ = os.Stdout.Write([]byte("\x1b[?1049l"))
+}
+
+// hideCursor stops the cursor from blinking at the end of the status line and from
+// jumping around while a page is redrawn (DECTCEM).
+func (r *Reader) hideCursor() {
+	_, _ = os.Stdout.Write([]byte("\x1b[?25l"))
+}
+
+func (r *Reader) showCursor() {
+	_, _ = os.Stdout.Write([]byte("\x1b[?25h"))
 }
 
 // renderPage draws exactly winHeight-1 content rows plus the status line. Every
@@ -395,6 +423,13 @@ func (r *Reader) Run() error {
 	defer r.close()
 	r.enterAltScreen()
 	defer r.exitAltScreen()
+	// Deferred in this order so the cursor is restored while the alternate screen is
+	// still current; otherwise the main screen would keep a hidden cursor.
+	r.hideCursor()
+	defer r.showCursor()
+	// Started before the setup work below, which can take long enough on a large
+	// file that a signal arriving there would skip the cleanup above.
+	go r.daemonCatchSignal()
 	r.clearScreenRaw()
 	if e := r.createIndex(); e != nil {
 		return e
