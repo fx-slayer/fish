@@ -55,7 +55,7 @@ func exit(i ...any) {
 			ei := i[0].(error)
 			fmt.Println(ei.Error())
 		default:
-			fmt.Println(i)
+			fmt.Println(i...)
 		}
 	}
 	os.Exit(0)

@@ -26,7 +26,8 @@ const (
 	CmdPrevLine
 	CmdNextHalfPage
 	CmdSwitchScrolling
-	CmdNULL // CmdNULL is used to indicate no command received but call Reader.renderPage.
+	CmdScrollTick // CmdScrollTick is emitted by daemonScrolling on every tick.
+	CmdResize     // CmdResize is emitted by daemonUpdateWindowSize on SIGWINCH.
 )
 
 // Reader is a command-line reader designed for reading books/long-text file.
@@ -51,23 +52,25 @@ type Reader struct {
 	winHeight         int
 	winWidth          int
 	scrollingLine     int
-	scrollingTk       <-chan time.Time
-	renderSignal      chan struct{}
+	scrollingTk       *time.Ticker
 	eventSignal       chan byte
 	quitSignal        chan struct{}
 }
 
 // NewReader creates new reader, f must be absolute file path.
+//
+// All mutable render state (currentLine, winWidth, winHeight, scrollingLine) is owned
+// exclusively by the Run event loop. Daemons must not touch it; they only emit commands
+// on eventSignal. This keeps both the state and stdout free of concurrent writers.
 func NewReader(f string) Reader {
 	return Reader{
-		f:            f,
-		index:        []string{},
-		progress:     make(map[string]int),
-		scrollingTk:  time.Tick(time.Second),
-		renderSignal: make(chan struct{}),
-		eventSignal:  make(chan byte),
-		quitSignal:   make(chan struct{}),
-		pageFactor:   0.75,
+		f:           f,
+		index:       []string{},
+		progress:    make(map[string]int),
+		scrollingTk: time.NewTicker(time.Second),
+		eventSignal: make(chan byte),
+		quitSignal:  make(chan struct{}),
+		pageFactor:  0.75,
 	}
 }
 
@@ -81,44 +84,81 @@ func NewReader(f string) Reader {
 // - 上/下/左/右箭头: 上一行/下一行/上一页/下一页
 // 通过 r.eventSignal channel 向主事件循环发送命令。
 func (r *Reader) daemonCatchInput() {
-	var b [3]byte
+	// A single Read may return several keypresses at once, or split one escape
+	// sequence across calls, so an incomplete tail stays in the buffer and is
+	// re-parsed once the remaining bytes arrive.
+	var buf [64]byte
+	fill := 0
 	for {
 		select {
 		case <-r.quitSignal:
 			return
 		default:
 		}
-		_, err := os.Stdin.Read(b[:])
-		if err != nil {
+		if fill == len(buf) {
+			fill = 0 // unreachable for the sequences handled here; avoids a zero-length Read
+		}
+		n, err := os.Stdin.Read(buf[fill:])
+		if err != nil || n == 0 {
 			continue
 		}
-		switch b[0] {
-		case 0x03, 0x04, 'q': // ctrl + c = 0x03 | ctrl + d = 0x04
-			r.eventSignal <- CmdExit
-		case 'a':
-			r.eventSignal <- CmdSwitchScrolling
-		case 0x0d: // key: enter
-			r.eventSignal <- CmdNextLine
-		case ' ':
-			r.eventSignal <- CmdNextHalfPage
-		case 0x1b:
-			if b[1] != 0x5b {
+		fill += n
+		i := 0
+		for i < fill {
+			cmd, size, ok := decodeKey(buf[i:fill])
+			if size == 0 {
+				break // incomplete sequence, wait for more input
+			}
+			i += size
+			if !ok {
 				continue
 			}
-			switch b[2] {
-			case 0x41: // up arrow
-				r.eventSignal <- CmdPrevLine
-			case 0x42: // down arrow
-				r.eventSignal <- CmdNextLine
-			case 0x43: // right arrow
-				r.eventSignal <- CmdNextPage
-			case 0x44: // left arrow
-				r.eventSignal <- CmdPrevPage
-			default:
-				continue
+			select {
+			case r.eventSignal <- cmd:
+			case <-r.quitSignal:
+				return
 			}
 		}
+		fill = copy(buf[:], buf[i:fill])
 	}
+}
+
+// decodeKey maps the leading keypress in b to a command. size is the number of
+// bytes consumed, or 0 when b holds an incomplete escape sequence that should be
+// retained until more input arrives. ok reports whether cmd is meaningful.
+func decodeKey(b []byte) (cmd byte, size int, ok bool) {
+	switch b[0] {
+	case 0x03, 0x04, 'q': // ctrl + c = 0x03 | ctrl + d = 0x04
+		return CmdExit, 1, true
+	case 'a', 'A':
+		return CmdSwitchScrolling, 1, true
+	case 0x0d: // key: enter
+		return CmdNextLine, 1, true
+	case ' ':
+		return CmdNextHalfPage, 1, true
+	case 0x1b:
+		if len(b) < 2 {
+			return 0, 0, false
+		}
+		if b[1] != 0x5b { // not a CSI sequence, drop the ESC only
+			return 0, 1, false
+		}
+		if len(b) < 3 {
+			return 0, 0, false
+		}
+		switch b[2] {
+		case 0x41: // up arrow
+			return CmdPrevLine, 3, true
+		case 0x42: // down arrow
+			return CmdNextLine, 3, true
+		case 0x43: // right arrow
+			return CmdNextPage, 3, true
+		case 0x44: // left arrow
+			return CmdPrevPage, 3, true
+		}
+		return 0, 3, false
+	}
+	return 0, 1, false
 }
 
 func (r *Reader) saveProgress() {
@@ -155,8 +195,15 @@ func (r *Reader) loadProgress() error {
 	if e != nil {
 		return e
 	}
-	if e := json.Unmarshal(pp, &r.progress); e != nil {
-		return e
+	// A corrupted or truncated progress file must not block reading, and a literal
+	// "null" unmarshals into a nil map that would panic on the next write.
+	if len(pp) > 0 {
+		if e := json.Unmarshal(pp, &r.progress); e != nil {
+			r.progress = nil
+		}
+	}
+	if r.progress == nil {
+		r.progress = make(map[string]int)
 	}
 	pos, ok := r.progress[r.f]
 	if ok {
@@ -177,33 +224,35 @@ func (r *Reader) createIndex() error {
 	return nil
 }
 
-func (r *Reader) updateWindowsSize() {
+func (r *Reader) updateWindowsSize() error {
 	width, height, err := term.GetSize(int(os.Stdout.Fd()))
 	if err != nil {
-		panic(err)
+		return err
 	}
 	r.winWidth = width
 	r.winHeight = height
-	r.renderPage()
+	return nil
 }
 
-// daemonUpdateWindowSize 监听终端窗口大小变化信号(SIGWINCH)。
-// 当用户调整终端窗口大小时，捕获该信号并立即重新计算窗口尺寸，
-// 重新渲染页面以适应新的窗口大小。
-// 这确保阅读器在任何时刻都与实际终端尺寸保持同步。
+// daemonUpdateWindowSize 监听终端窗口大小变化信号(SIGWINCH)，
+// 并向主事件循环投递 CmdResize，由主循环重新取尺寸并渲染。
+// 该 goroutine 自身不读写任何渲染状态。
 func (r *Reader) daemonUpdateWindowSize() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGWINCH)
-	go func() {
-		for {
+	defer signal.Stop(sigCh)
+	for {
+		select {
+		case <-sigCh:
 			select {
-			case <-sigCh:
-				r.updateWindowsSize()
+			case r.eventSignal <- CmdResize:
 			case <-r.quitSignal:
 				return
 			}
+		case <-r.quitSignal:
+			return
 		}
-	}()
+	}
 }
 
 func (r *Reader) enterRawMode() (restore func(), err error) {
@@ -273,35 +322,17 @@ func (r *Reader) renderPage() {
 	r.saveProgress()
 }
 
-// daemonRenderPage 监听渲染信号并负责页面刷新。
-// 当收到 r.renderSignal 信号时，调用 renderPage() 重新绘制当前页面。
-// 这种基于信号的渲染方式避免了不必要的频繁刷新，提高了性能。
-// 使用 channel 实现事件驱动的渲染机制，确保渲染和输入处理的并发安全。
-func (r *Reader) daemonRenderPage() {
-	for {
-		select {
-		case <-r.renderSignal:
-			r.renderPage()
-		case <-r.quitSignal:
-			return
-		}
-	}
-}
-
-// daemonScrolling 实现自动滚屏功能，每秒触发一次(由 r.scrollingTk 时间ticker驱动)。
-// 当启用自动滚屏时(scrollingLine > 0)，每秒向下自动翻滚指定行数。
-// scrollingLine 的值为0(关闭)、1或2，用户可通过按'a'键循环切换。
-// 每次自动滚屏后发送 CmdNULL 命令触发页面重新渲染，更新显示内容。
-// 到达文末时停止滚屏。
+// daemonScrolling 每秒向主事件循环投递一次 CmdScrollTick。
+// 是否真的滚屏、滚几行由主循环依据 scrollingLine 决定，
+// 该 goroutine 自身不读写任何渲染状态。
 func (r *Reader) daemonScrolling() {
 	for {
 		select {
-		case <-r.scrollingTk:
-			if r.scrollingLine > 0 {
-				if r.currentLine < r.totalLine-1 {
-					r.currentLine += r.scrollingLine
-				}
-				r.eventSignal <- CmdNULL
+		case <-r.scrollingTk.C:
+			select {
+			case r.eventSignal <- CmdScrollTick:
+			case <-r.quitSignal:
+				return
 			}
 		case <-r.quitSignal:
 			return
@@ -320,7 +351,9 @@ func (r *Reader) Run() error {
 	if e := r.loadProgress(); e != nil {
 		return e
 	}
-	r.updateWindowsSize()
+	if e := r.updateWindowsSize(); e != nil {
+		return e
+	}
 	rstore, e := r.enterRawMode()
 	if e != nil {
 		return e
@@ -328,16 +361,29 @@ func (r *Reader) Run() error {
 	defer rstore()
 	go r.daemonUpdateWindowSize()
 	go r.daemonScrolling()
-	go r.daemonRenderPage()
 	go r.daemonCatchInput()
-	if r.currentLine > r.totalLine {
+	// The saved progress may exceed the file if it was edited since the last run,
+	// and a hand-edited progress file may hold a negative value.
+	if r.currentLine >= r.totalLine {
+		r.currentLine = r.totalLine - 1
+	}
+	if r.currentLine < 0 {
 		r.currentLine = 0
 	}
 	r.renderPage()
 	for {
 		switch <-r.eventSignal {
-		case CmdNULL:
-			// no op.
+		case CmdResize:
+			if e := r.updateWindowsSize(); e != nil {
+				return e
+			}
+		case CmdScrollTick:
+			if r.scrollingLine <= 0 {
+				continue
+			}
+			if r.currentLine < r.totalLine-1 {
+				r.currentLine += r.scrollingLine
+			}
 		case CmdSwitchScrolling:
 			if r.scrollingLine == 2 {
 				r.scrollingLine = 0
@@ -379,7 +425,7 @@ func (r *Reader) Run() error {
 				r.currentLine = r.totalLine - 1
 			}
 		}
-		r.renderSignal <- struct{}{}
+		r.renderPage()
 	}
 }
 
@@ -391,6 +437,9 @@ func (r *Reader) setBreakMark() {
 func (r *Reader) close() {
 	if r.progressFD != nil {
 		_ = r.progressFD.Close()
+	}
+	if r.scrollingTk != nil {
+		r.scrollingTk.Stop()
 	}
 	close(r.quitSignal)
 }
