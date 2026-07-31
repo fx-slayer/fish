@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"os/signal"
 	"path"
@@ -32,10 +31,12 @@ const (
 
 // Reader is a command-line reader designed for reading books/long-text file.
 //
-// Reader.pageFactor: Default 0.75 ,due to line wrapping of long single lines, the terminal height does not
-// always match the number of text lines, so precise page turns cannot be achieved.
-// To ensure that the number of lines turned is less than the actual terminal height,
-// the actual NextPage/PrevPage commands use fewer lines than the ideal count.
+// Rendering works on visual lines: every logical line of the file is pre-folded to
+// the terminal width (accounting for double-width characters), so one entry of
+// Reader.index always occupies exactly one terminal row. Paging can therefore be
+// exact, and long lines no longer overflow the screen and scroll the page away.
+// Reader.currentLine indexes visual lines, while progress is persisted as a logical
+// line number so it stays valid across terminal widths.
 type Reader struct {
 	f                 string
 	data              string
@@ -43,10 +44,13 @@ type Reader struct {
 	progressFD        *os.File
 	progress          map[string]int // map[abs-filepath]progress
 	previousSavedLine int
-	jumpBreakMark     int
-	pageFactor        float64 // see Reader doc.
+	savedLogical      int // logical line restored from the progress file
+	jumpBreakMark     int // visual line the break mark is drawn above
+	lastPageLines     int // content rows emitted by the last renderPage
 	displayBreakMark  bool
-	index             []string // line number:line content
+	lines             []string // logical lines, as split from the file
+	index             []vLine  // visual lines, folded to the terminal width
+	firstVis          []int    // logical line -> first visual line
 	totalLine         int
 	currentLine       int
 	winHeight         int
@@ -57,6 +61,12 @@ type Reader struct {
 	quitSignal        chan struct{}
 }
 
+// vLine is one terminal row: the text to print plus the logical line it came from.
+type vLine struct {
+	text    string
+	logical int
+}
+
 // NewReader creates new reader, f must be absolute file path.
 //
 // All mutable render state (currentLine, winWidth, winHeight, scrollingLine) is owned
@@ -64,13 +74,13 @@ type Reader struct {
 // on eventSignal. This keeps both the state and stdout free of concurrent writers.
 func NewReader(f string) Reader {
 	return Reader{
-		f:           f,
-		index:       []string{},
-		progress:    make(map[string]int),
-		scrollingTk: time.NewTicker(time.Second),
-		eventSignal: make(chan byte),
-		quitSignal:  make(chan struct{}),
-		pageFactor:  0.75,
+		f:            f,
+		index:        []vLine{},
+		progress:     make(map[string]int),
+		scrollingTk:  time.NewTicker(time.Second),
+		eventSignal:  make(chan byte),
+		quitSignal:   make(chan struct{}),
+		savedLogical: -1,
 	}
 }
 
@@ -163,10 +173,12 @@ func decodeKey(b []byte) (cmd byte, size int, ok bool) {
 
 func (r *Reader) saveProgress() {
 	// TODO exec when quit only?
-	if r.previousSavedLine == r.currentLine {
+	// Progress is stored as a logical line so it survives a terminal resize.
+	cur := r.logicalAt(r.currentLine)
+	if r.previousSavedLine == cur {
 		return
 	}
-	r.previousSavedLine = r.currentLine
+	r.previousSavedLine = cur
 	r.progress[r.f] = r.previousSavedLine
 	pp, _ := json.MarshalIndent(r.progress, "", "  ")
 	_ = r.progressFD.Truncate(0)
@@ -207,7 +219,7 @@ func (r *Reader) loadProgress() error {
 	}
 	pos, ok := r.progress[r.f]
 	if ok {
-		r.currentLine = pos
+		r.savedLogical = pos
 		r.previousSavedLine = pos
 	}
 	return nil
@@ -219,9 +231,39 @@ func (r *Reader) createIndex() error {
 		return e
 	}
 	r.data = string(dd)
-	r.index = strings.Split(r.data, "\n")
-	r.totalLine = len(r.index)
+	r.lines = strings.Split(r.data, "\n")
 	return nil
+}
+
+// buildVisualIndex folds every logical line to the current terminal width so that
+// one index entry maps to exactly one terminal row. It must be called after the
+// window size is known and again whenever the width changes.
+func (r *Reader) buildVisualIndex() {
+	r.index = make([]vLine, 0, len(r.lines))
+	r.firstVis = make([]int, len(r.lines))
+	for li, l := range r.lines {
+		r.firstVis[li] = len(r.index)
+		for _, chunk := range foldLine(l, r.winWidth) {
+			r.index = append(r.index, vLine{text: chunk, logical: li})
+		}
+	}
+	r.totalLine = len(r.index)
+}
+
+// logicalAt returns the logical line shown at visual line v.
+func (r *Reader) logicalAt(v int) int {
+	if v < 0 || v >= len(r.index) {
+		return 0
+	}
+	return r.index[v].logical
+}
+
+// visualAt returns the first visual line of logical line l.
+func (r *Reader) visualAt(l int) int {
+	if l < 0 || l >= len(r.firstVis) {
+		return 0
+	}
+	return r.firstVis[l]
 }
 
 func (r *Reader) updateWindowsSize() error {
@@ -267,11 +309,14 @@ func (r *Reader) enterRawMode() (restore func(), err error) {
 }
 
 func (r *Reader) printInfo() {
+	cur, total := r.logicalAt(r.currentLine)+1, len(r.lines)
 	var percentage float64
-	if r.totalLine > 0 {
-		percentage = float64(r.currentLine) / float64(r.totalLine) * 100
+	if total > 0 {
+		percentage = float64(cur) / float64(total) * 100
 	}
-	_, _ = fmt.Fprintf(os.Stdout, "> %s %d/%d %.02f%% [Q]:Quit [A]:Scroll(%s)", path.Base(r.f), r.currentLine, r.totalLine, percentage, r.scrollInfo())
+	s := fmt.Sprintf("> %s %d/%d %.02f%% [Q]:Quit [A]:Scroll(%s)", path.Base(r.f), cur, total, percentage, r.scrollInfo())
+	// The status line owns the last row; wrapping it would scroll the page.
+	_, _ = fmt.Fprint(os.Stdout, truncateWidth(s, r.winWidth))
 }
 
 func (r *Reader) scrollInfo() string {
@@ -299,23 +344,29 @@ func (r *Reader) exitAltScreen() {
 	_, _ = os.Stdout.Write([]byte("\x1b[?1049l"))
 }
 
+// renderPage draws exactly winHeight-1 content rows plus the status line. Every
+// emitted row is one terminal row, and the break mark consumes a row of the page
+// budget, so the output can never exceed the screen and scroll the top away.
 func (r *Reader) renderPage() {
-	start := r.currentLine
 	r.clearScreenRaw()
-	pageLines := r.winHeight - 1
-	end := start + pageLines
-	if end > len(r.index) {
-		end = len(r.index)
-	}
-	for i := start; i < end; i++ {
+	pageLines := r.pageLines()
+	used, shown := 0, 0
+	for i := r.currentLine; i < len(r.index) && used < pageLines; i++ {
 		if r.displayBreakMark && i == r.jumpBreakMark {
-			br := strings.Repeat(">", r.winWidth*3/4)
-			_, _ = fmt.Fprint(os.Stdout, br+"\r\n"+r.index[i]+"\r\n")
-		} else {
-			_, _ = fmt.Fprint(os.Stdout, r.index[i]+"\r\n")
+			if used+1 >= pageLines {
+				break // no room for both the mark and its line
+			}
+			_, _ = fmt.Fprint(os.Stdout, strings.Repeat(">", r.winWidth*3/4)+"\r\n")
+			used++
 		}
+		_, _ = fmt.Fprint(os.Stdout, r.index[i].text+"\r\n")
+		used++
+		shown++
 	}
-	for i := end - start; i < pageLines; i++ {
+	// Paging advances by index entries, which is fewer than the rows drawn when the
+	// break mark took one of them.
+	r.lastPageLines = shown
+	for i := used; i < pageLines; i++ {
 		_, _ = fmt.Fprint(os.Stdout, "\r\n")
 	}
 	r.printInfo()
@@ -354,6 +405,16 @@ func (r *Reader) Run() error {
 	if e := r.updateWindowsSize(); e != nil {
 		return e
 	}
+	r.buildVisualIndex()
+	// savedLogical stays -1 when the file has no stored progress. A saved line may
+	// also exceed the file if it was edited since the last run.
+	if r.savedLogical >= len(r.lines) {
+		r.savedLogical = len(r.lines) - 1
+	}
+	if r.savedLogical >= 0 {
+		r.currentLine = r.visualAt(r.savedLogical)
+	}
+	r.clampCurrentLine()
 	rstore, e := r.enterRawMode()
 	if e != nil {
 		return e
@@ -362,28 +423,28 @@ func (r *Reader) Run() error {
 	go r.daemonUpdateWindowSize()
 	go r.daemonScrolling()
 	go r.daemonCatchInput()
-	// The saved progress may exceed the file if it was edited since the last run,
-	// and a hand-edited progress file may hold a negative value.
-	if r.currentLine >= r.totalLine {
-		r.currentLine = r.totalLine - 1
-	}
-	if r.currentLine < 0 {
-		r.currentLine = 0
-	}
 	r.renderPage()
 	for {
 		switch <-r.eventSignal {
 		case CmdResize:
+			// Keep the reader anchored on the same logical line across a resize.
+			anchor := r.logicalAt(r.currentLine)
+			prevWidth := r.winWidth
 			if e := r.updateWindowsSize(); e != nil {
 				return e
 			}
+			if r.winWidth != prevWidth {
+				r.buildVisualIndex()
+				r.currentLine = r.visualAt(anchor)
+				r.displayBreakMark = false
+			}
+			r.clampCurrentLine()
 		case CmdScrollTick:
 			if r.scrollingLine <= 0 {
-				continue
+				continue // scrolling is off, nothing changed, skip the redraw
 			}
-			if r.currentLine < r.totalLine-1 {
-				r.currentLine += r.scrollingLine
-			}
+			r.currentLine += r.scrollingLine
+			r.displayBreakMark = false
 		case CmdSwitchScrolling:
 			if r.scrollingLine == 2 {
 				r.scrollingLine = 0
@@ -392,45 +453,53 @@ func (r *Reader) Run() error {
 			}
 		case CmdExit:
 			return nil
-		case CmdNextPage: // actually set to next 0.75 page
-			r.setBreakMark()
-			off := int(math.Round(float64(r.winHeight) * r.pageFactor))
-			if r.currentLine+off < r.totalLine {
-				r.currentLine += off
-			} else if r.currentLine < r.totalLine-1 {
-				r.currentLine = r.totalLine - 1
-			}
-		case CmdPrevPage: // actually set to prev 0.75 page
-			r.setBreakMark()
-			off := int(math.Round(float64(r.winHeight) * r.pageFactor))
-			if r.currentLine-off >= 0 {
-				r.currentLine -= off
-			} else {
-				r.currentLine = 0
-			}
+		case CmdNextPage:
+			// Advance by exactly what was drawn, so no line is skipped or repeated.
+			// A full page shares no rows with the previous one, so there is no
+			// boundary worth marking.
+			r.currentLine += r.lastPageLines
+			r.displayBreakMark = false
+		case CmdPrevPage:
+			r.currentLine -= r.pageLines()
+			r.displayBreakMark = false
 		case CmdNextLine:
-			if r.currentLine < r.totalLine-1 {
-				r.currentLine++
-			}
+			r.currentLine++
+			r.displayBreakMark = false
 		case CmdPrevLine:
-			if r.currentLine > 0 {
-				r.currentLine--
-			}
+			r.currentLine--
+			r.displayBreakMark = false
 		case CmdNextHalfPage:
-			r.setBreakMark()
-			off := r.winHeight / 2
-			if r.currentLine+off < r.totalLine {
-				r.currentLine += off
-			} else if r.currentLine < r.totalLine-1 {
-				r.currentLine = r.totalLine - 1
-			}
+			// Half a page is re-shown, so mark where unread content starts.
+			r.setBreakMark(r.currentLine + r.pageLines())
+			r.currentLine += r.pageLines() / 2
 		}
+		r.clampCurrentLine()
 		r.renderPage()
 	}
 }
 
-func (r *Reader) setBreakMark() {
-	r.jumpBreakMark = r.currentLine + r.winHeight - 1
+// pageLines is the number of content rows available above the status line.
+func (r *Reader) pageLines() int {
+	if r.winHeight < 2 {
+		return 1
+	}
+	return r.winHeight - 1
+}
+
+func (r *Reader) clampCurrentLine() {
+	if r.currentLine >= r.totalLine {
+		r.currentLine = r.totalLine - 1
+	}
+	if r.currentLine < 0 {
+		r.currentLine = 0
+	}
+}
+
+// setBreakMark records the visual line where content new to this jump begins, so
+// the reader can see where to resume. The mark is dropped on the next single-line
+// move or resize.
+func (r *Reader) setBreakMark(at int) {
+	r.jumpBreakMark = at
 	r.displayBreakMark = true
 }
 
