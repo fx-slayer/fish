@@ -1,5 +1,7 @@
 ### README
 
+English | [简体中文](README.ZH.md)
+
 `fish` is a command-line reader designed for reading books, may support the following features:
 
 > for slacking off, terminal env makes you look more like you're working.
@@ -7,8 +9,6 @@
 - Remember reading line number.✅
 
 - Display reading progress.✅
-
-- TOC.❌
 
 - Shortcut for next/prev page.✅
 
@@ -42,6 +42,8 @@ does not shift your position.
 #### Install
 
 ```bash
+git clone https://github.com/fx-slayer/fish.git
+cd fish
 make install
 ```
 
